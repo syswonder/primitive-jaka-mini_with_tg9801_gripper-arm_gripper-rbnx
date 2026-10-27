@@ -1,4 +1,4 @@
-# primitive-jaka-rbnx — JAKA arm primitive
+# primitive-jaka-mini_with_tg9801_gripper-arm_gripper-rbnx — JAKA arm primitive
 
 Robonix arm primitive for the fixed-base **JAKA Mini** 6-DOF arm with a
 **TG-9801** adaptive gripper (end RS485 channel), driven over TCP by the
@@ -21,7 +21,7 @@ Motion commands (`joint_command` / `pos_command`) are **rejected** while
 config `motion_enabled` is false (the default) — only feedback streams. Boot
 read-only first, verify feedback and estop, then enable motion in the deploy
 manifest. See the staged acceptance flow in the deploy repo
-(`robot-jaka-mini`).
+(`robot-jaka-mini_with_tg9801_gripper`).
 
 ## JAKA SDK binaries
 
@@ -37,7 +37,7 @@ instructions when they are missing.
 ## Build
 
 ```bash
-rbnx build -p /path/to/primitive-jaka-rbnx
+rbnx build -p /path/to/primitive-jaka-mini_with_tg9801_gripper-arm_gripper-rbnx
 ```
 
 Creates a package-local venv (`--system-site-packages`, so system rclpy is
