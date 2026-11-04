@@ -1,8 +1,9 @@
 # jaka_arm capability notes
 
-JAKA 6-DOF arm (jkrc SDK over TCP) with a TG-9801 adaptive gripper on the
-end RS485 channel. Provider ID is the deploy instance `name` (default
-`jaka_arm`).
+JAKA 6-DOF arm (jkrc SDK over TCP) with a TG-9801 adaptive gripper driven
+through the controller's extended-IO channels (a Coboπ Modbus-RTU slave; the
+controller's RS485 signal table is unusable on firmware 3.3.15). Provider ID is
+the deploy instance `name` (default `jaka_arm`).
 
 ## Frames and units
 
@@ -16,10 +17,14 @@ end RS485 channel. Provider ID is the deploy instance `name` (default
 - The gripper is a prismatic joint `gripper_joint` in **m** (0 = closed,
   `0.098` = fully open; TG-9801 stroke). Adaptive mode is binary: values
   below half stroke close to the configured force, at/above half stroke open.
-- A TG-9801 position read costs ~1.3 s (single-entry RS485 signal-table
-  path), so `gripper_joint` refreshes at ~0.5 Hz: the last reading is
-  republished at the full rate in between and may lag the fingers by up to a
-  couple of seconds. Arm joints are unaffected.
+- Gripper feedback comes from the extended-IO analog inputs (`get_analog_input`,
+  one gRPC round trip), so `gripper_joint` refreshes at 5 Hz over a cached
+  value. The raw position register is a **closure** amount (1000 = closed,
+  0 = open); the provider inverts it against the travel endpoints. Writes go to
+  the analog outputs (speed + action). The Coboπ slave must be running
+  (`983126`), the controller must be in **Remote** control source (`10007`), and
+  the session must be gRPC: with legacy `login()` the SDK aborts on the first
+  ext-IO call. Arm joints are unaffected.
 
 ## Capabilities
 

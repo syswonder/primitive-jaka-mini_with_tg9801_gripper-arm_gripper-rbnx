@@ -3,54 +3,42 @@
 # Adapted from AIIT-Roboarm (arm/jaka_gripper.py), MIT License,
 # Copyright (c) 2025 Xu Jinyang & Hou Yunlong. See NOTICE.
 """
-JakaGripper：经 JAKA 末端 RS485L 控制 HKV TG-9801 夹爪（独立 SDK，仅依赖 jkrc）
+JakaGripper：经 JAKA 扩展 IO（Coboπ Modbus 从站）控制 HKV TG-9801 夹爪。
 
-实现 hkv_tg9801 SDK 的读 + 运动 + 运行参数 + 维护接口，并补充 SDK 未覆盖的三维力
-(Fx/Fy/Fz)读取。仅排除「危险配置」类（永久改配置/可能失联）。
-  · 读接口（read_*）    → 信号量（控制器 Modbus RTU 主站周期轮询）
-  · 运动接口（grip/release/force_position_control/follow_control）→ send_tio_rs_command 透传
-  · 运行参数接口（set_adaptive_speed/set_target_force/set_control_mode/
-                  set_force_position_speed/set_force_position_target）→ 透传写
-  · 维护指令（calibrate_fingertip/clear_fingertip_zero）→ 透传写（手册推荐定期执行）
-  · 三维力（read_force_fx/fy/fz，寄存器 0x0000~0x0002，有符号 int16，SDK 未实现）
+为什么不是 RS485 信号表（2026-11-03 实机结论，固件 3.3.15 + SDK 2.3.3beta2）：
+  · `get_rs485_signal_info()` 在 legacy 登录下必 SIGSEGV、grpc 登录下恒返 8 个空槽；
+  · `add_tio_rs_signal` 返 0 但不落表，`update_tio_rs_signal` 恒返 260；
+  · 换固件、换通道号/信号类型、切自动模式、改调用顺序都无效。
+改走控制器自带的「扩展 IO」：Coboπ 里建 TIO Modbus RTU 从站轮询夹爪寄存器，
+SDK 侧只做模拟量读写：
 
-排除的「危险配置」接口（永久改配置/可能失联，未实现）：
-  set_protocol / set_device_id / set_baudrate / set_eeprom_enabled /
-  set_open_position / set_close_position
+    读  get_analog_input(IO_EXTEND, ai_idx, submodule_id)
+    写  set_analog_output(IO_EXTEND, ao_idx, value, submodule_id)
 
-字节序：手册 3.3.2 称通信为小端序，u32 寄存器(grip_count/baudrate)低字在前。
+通道映射与 Coboπ 的从站配置一一对应（见 EXTIO_AI / EXTIO_AO）。
 
-读策略：本控制器（RC 1.7.2）的信号量表在「表里 ≥2 条」时槽位会错位——值张冠李戴、
-间歇全 0（2026-10-08 直连控制器实测），唯一可靠的读法是「表里只放 1 条 +
-update_tio_rs_signal 强制轮询」。因此所有读接口都走 _read_reg 逐寄存器读（约 1.3s/个），
-低频接口也按需逐条读。
+寄存器语义（2026-11-03 实物确认）：
+  · 位置 0x0008 是**闭合量**：1000 = 全闭、0 = 全开（与常见「1000=全开」相反）；
+  · 动作 0x000B：1 = 夹取（位置走到 1000）、0 = 松开（走到 0）。
 
-依赖：仅 `import jkrc`（JAKA SDK，jkrc.pyd/jkrc.so 需在 sys.path 可导入）。
-      CRC16 已内联，不再依赖 hkv_tg9801 示例 SDK。
+前置条件（缺一不可）：
+  · Coboπ 里从站在运行（`is_extio_running()` 为 1），否则读写都返 10003；
+  · 控制器控制源在「远程/Remote」，否则写操作返 10007（gRPC Code 7）。
+
+只保留扩展 IO 能覆盖的通道：位置/电流/状态（读）与速度/动作（写）。
+其余寄存器（三维力、目标力、力位参数、出厂信息等）没有配置通道，读返回 None、
+写返回 -1 并打印一次告警——需要时在 Coboπ 里加通道并扩展这里的映射。
 
 连接模式：
   · robot=None（默认）：独立模式，自建 jkrc.RC 并 login，close() 时 logout；
-  · robot=<RC实例>：共享模式，复用外部已 login 的连接（控制器 SDK 连接数有限，
-    与机械臂适配器 JakaBySDK 共用一条连接时必须用此模式），close() 不 logout。
-
-说明：
-  · force_position_control 需先 set_control_mode(1) 切到「力位」模式；
-    follow_control 需夹爪处于「跟随」模式。
+  · robot=<RC实例>：共享模式，复用外部已 login 的连接，close() 不 logout。
 """
 import time
 
 import jkrc
 
-
-def crc16_modbus(payload: bytes) -> bytes:
-    """Modbus RTU CRC16，返回低字节在前的线路字节序。"""
-    value = 0xFFFF
-    for byte in payload:
-        value ^= byte
-        for _ in range(8):
-            value = (value >> 1) ^ 0xA001 if value & 1 else value >> 1
-    return value.to_bytes(2, byteorder="little")
-
+# IOType：0 = 控制柜面板 IO，1 = 工具 IO，2 = 扩展 IO
+IO_EXTEND = 2
 
 # 夹爪 Modbus 寄存器地址（TG-9801 手册，与 hkv_tg9801/modbus.py 一致）
 REG = {
@@ -59,7 +47,7 @@ REG = {
     "force_fz": 0x0002,        # Fz
     "state": 0x0006,           # 夹持状态 0空闲/1运动/2夹稳/3打滑
     "hardness": 0x0007,        # 硬度
-    "position": 0x0008,        # 位置
+    "position": 0x0008,        # 位置（闭合量：1000 全闭、0 全开）
     "current": 0x0009,         # 电流(mA)
     "adaptive_speed": 0x000A,  # 自适应速度
     "action": 0x000B,          # 动作 0松开/1夹取
@@ -82,15 +70,25 @@ REG = {
     "eeprom_enabled": 0x00EE,  # EEPROM开关
 }
 
-SIG_HOLDING = 3   # 保持寄存器(03功能码)
-SIG_INPUT = 4     # 输入寄存器(04功能码)
+# 扩展 IO 通道映射（Coboπ → 设置/硬件与通信/Modbus 设置 里那个从站）
+# 只列当前从站实际配了的通道；改配置时同步改这里。
+EXTIO_AI = {
+    "position": 0,   # 位置（闭合量）
+    "current": 1,    # 电流 mA
+    "state": 2,      # 夹持状态
+}
+EXTIO_AO = {
+    "adaptive_speed": 0,  # 自适应速度
+    "action": 1,          # 动作 1=夹取 0=松开
+}
+
+# 寄存器地址 → AI 通道，由 EXTIO_AI 反推
+_ADDR_TO_AI = {REG[name]: idx for name, idx in EXTIO_AI.items()}
 
 
 class JakaGripper:
-    def __init__(self, robot=None, ip="10.5.5.100", chn=1, slave_id=1, baudrate=115200):
-        self.chn = chn
-        self.slave_id = slave_id
-        self.baudrate = baudrate
+    def __init__(self, robot=None, ip="10.5.5.100", submodule_id=54052):
+        self.submodule_id = int(submodule_id)
         self._shared_robot = robot is not None
         if self._shared_robot:
             self.robot = robot
@@ -99,157 +97,136 @@ class JakaGripper:
             ret = self.robot.login()
             if ret[0] != 0:
                 raise ConnectionError(f"login 失败: {ret}")
-        self._config_channel()
-        self._clear_signals()  # 清掉历史遗留条目，避免脏表干扰单条目读
-
-    def _config_channel(self) -> None:
-        """配置末端 RS485L 通道为 Modbus RTU 主站模式。
-
-        上电周期会复位通道配置，因此每次 power_on 后必须重新调用；
-        未重新配置时信号量轮询不到值（全 0）、透传写入无效。
-        """
-        self.robot.set_tio_pin_mode(2, 1)                # 使能 RS485L
-        self.robot.set_rs485_chn_mode(self.chn, 0)       # Modbus RTU 主站模式
-        self.robot.set_rs485_chn_comm({
-            'chn_id': self.chn, 'slave_id': self.slave_id,
-            'baudrate': self.baudrate,
-            'databit': 8, 'stopbit': 1, 'parity': 78})
+        self._warned = set()
 
     def close(self) -> None:
         if not self._shared_robot:
             self.robot.logout()
 
+    # ---------- 扩展 IO 可用性 ----------
+    def extio_running(self) -> bool:
+        ret = self.robot.is_extio_running()
+        return ret[0] == 0 and bool(ret[1])
+
+    def _warn_once(self, key: str, message: str) -> None:
+        if key not in self._warned:
+            self._warned.add(key)
+            print(message, flush=True)
+
     def power_on(self) -> None:
-        """机械臂上电（末端 RS485 接口与夹爪供电依赖上电才通信）。"""
+        """机械臂上电，并等夹爪扩展 IO 就绪（有电流读数）。"""
         self.robot.power_on()
         time.sleep(2)
-        # 上电会复位 RS485 通道配置，必须先重新配置才能通信
-        self._config_channel()
-        self._clear_signals()
-        # 等夹爪就绪：就绪后会有待机电流（current 非 0）。单次读约 1.3s（见 _read_reg）
+        # 从站没跑时读到的仍是上一次轮询的缓存值，所以先看运行标志再等电流
+        if not self.extio_running():
+            self._warn_once(
+                "extio",
+                "[gripper] 扩展 IO 从站未运行：请在 Coboπ 的 Modbus 设置里启动从站",
+            )
         for _ in range(8):
             cur = self._read_reg(REG["current"])
             if cur:
                 return
-        print("Warning: 夹爪未就绪（电流一直为 0），"
-              "请检查 RS485 接线与通道配置")
+            time.sleep(0.2)
+        print("Warning: 夹爪无电流读数，检查从站是否运行、RS485 接线与供电", flush=True)
 
     def power_off(self) -> None:
         """机械臂下电。"""
         self.robot.power_off()
 
-    # ---------- 写：透传 Modbus 帧 ----------
-    def _send(self, payload: bytes) -> int:
-        frame = payload + crc16_modbus(payload)
-        return self.robot.send_tio_rs_command(self.chn, bytearray(frame))[0]
+    # ---------- 底层：模拟量读写 ----------
+    def _read_ai(self, idx: int):
+        ret = self.robot.get_analog_input(IO_EXTEND, int(idx), self.submodule_id)
+        if ret[0] != 0 or len(ret) < 2:
+            return None
+        return int(round(float(ret[1])))
+
+    def _write_ao(self, idx: int, value) -> int:
+        ret = self.robot.set_analog_output(
+            IO_EXTEND, int(idx), float(value), self.submodule_id)
+        return int(ret[0])
+
+    # ---------- 读寄存器（只覆盖已配置的 AI 通道） ----------
+    def _read_reg(self, addr: int):
+        idx = _ADDR_TO_AI.get(addr)
+        if idx is None:
+            self._warn_once(
+                f"na-{addr}",
+                f"[gripper] 寄存器 0x{addr:04X} 没有扩展 IO 通道，读返回 None",
+            )
+            return None
+        return self._read_ai(idx)
 
     def _write_reg(self, addr: int, value: int) -> int:
-        p = bytes([self.slave_id, 0x06]) + addr.to_bytes(2, "big") + value.to_bytes(2, "big")
-        return self._send(p)
-
-    def _write_regs(self, addr: int, values: list) -> int:
-        data = b"".join(v.to_bytes(2, "big") for v in values)
-        p = (bytes([self.slave_id, 0x10]) + addr.to_bytes(2, "big")
-             + len(values).to_bytes(2, "big") + bytes([len(data)]) + data)
-        return self._send(p)
-
-    # ---------- 读：信号量 ----------
-    def _clear_signals(self) -> None:
-        info = self.robot.get_rs485_signal_info()
-        if info[0] == 0:
-            for s in info[1]:
-                try:
-                    self.robot.del_tio_rs_signal(s["sig_name"])
-                except Exception:
-                    pass
-
-    def _add_signal(self, name: str, addr: int, sig_type: int = SIG_HOLDING) -> None:
-        self.robot.add_tio_rs_signal({
-            'sig_name': name, 'chn_id': self.chn, 'sig_type': sig_type,
-            'sig_addr': addr, 'value': 0, 'frequency': 5})
-
-    # 单条目读的等待时间：注册后等控制器写入表、update 触发轮询后等应答写回。
-    # 实测 (0.4,0.5) 12 次中 1 次失败、(0.6,0.6) 12/12 成功，取保守值。
-    _READ_WAIT_ADD = 0.5
-    _READ_WAIT_UPDATE = 0.6
-
-    def _read_reg(self, addr: int, sig_type: int = SIG_HOLDING, retries: int = 2):
-        """读单个寄存器（16 位无符号），失败返回 None。
-
-        唯一可靠读法：表里只放 1 条 → update_tio_rs_signal 强制轮询 → 读表。
-        多条目表的槽位会错位（值张冠李戴）。读后删除条目保持总线安静，
-        避免轮询流量与写指令抢 RS485 总线导致写丢帧。
-        """
-        for _ in range(max(1, retries)):
-            self._add_signal("_rd", addr, sig_type)
-            time.sleep(self._READ_WAIT_ADD)
-            self.robot.update_tio_rs_signal({"sig_name": "_rd", "frequency": 5})
-            time.sleep(self._READ_WAIT_UPDATE)
-            info = self.robot.get_rs485_signal_info()
-            if info[0] == 0:
-                for s in info[1]:
-                    if s["sig_name"] == "_rd":
-                        self.robot.del_tio_rs_signal("_rd")
-                        return s["value"]
-        self.robot.del_tio_rs_signal("_rd")
-        return None
-
-    def _read_regs(self, addr: int, count: int, sig_type: int = SIG_HOLDING) -> list:
-        """读连续 count 个寄存器（逐个读，见 _read_reg）。"""
-        return [self._read_reg(addr + i, sig_type) for i in range(count)]
+        """单寄存器写。只有动作寄存器走扩展 IO，其余通道未配置。"""
+        self._warn_once(
+            f"wr-{addr}",
+            f"[gripper] 寄存器 0x{addr:04X} 没有可写的扩展 IO 通道，写被忽略",
+        )
+        return -1
 
     # ---------- 运动接口 ----------
+    def _set_speed(self, speed: int) -> int:
+        return self._write_ao(EXTIO_AO["adaptive_speed"], int(speed))
+
+    def _set_action(self, action: int) -> int:
+        return self._write_ao(EXTIO_AO["action"], int(action))
+
     def grip(self, speed: int = 1000) -> int:
-        return self._write_regs(REG["adaptive_speed"], [speed, 1])
+        """夹取：先写速度，再写动作=1（位置走到 1000）。"""
+        code = self._set_speed(speed)
+        if code != 0:
+            return code
+        return self._set_action(1)
 
     def release(self, speed: int = 1000) -> int:
-        """松开。与 grip 同为 0x10 多寄存器写 [速度, 动作=0]——实测 0x06
-        单寄存器写动作寄存器在本夹爪固件上不生效。"""
-        return self._write_regs(REG["adaptive_speed"], [speed, 0])
+        """松开：先写速度，再写动作=0（位置走到 0）。"""
+        code = self._set_speed(speed)
+        if code != 0:
+            return code
+        return self._set_action(0)
 
     def force_position_control(self, speed: int, position: int) -> int:
-        return self._write_regs(REG["force_pos_speed"], [speed, position])
+        return self._unsupported("force_position_control")
 
     def follow_control(self, speed: int, position: int) -> int:
-        return self._write_regs(REG["follow_speed"], [speed, position])
+        return self._unsupported("follow_control")
 
     # ---------- 维护指令 ----------
     def calibrate_fingertip(self, value: int = 1) -> int:
-        """指尖力强制校准（手册推荐定期执行，消除累积误差）。写 0x0011。"""
-        return self._write_reg(REG["fingertip_calibration"], value)
+        return self._unsupported("calibrate_fingertip")
 
     def clear_fingertip_zero(self, value: int = 1) -> int:
-        """指尖力硬件清零（消除零点漂移）。写 0x001D。"""
-        return self._write_reg(REG["fingertip_zero"], value)
+        return self._unsupported("clear_fingertip_zero")
 
     # ---------- 运行参数接口 ----------
     def set_adaptive_speed(self, speed: int) -> int:
-        """设自适应夹取速度(200~1500)：写 0x000A。"""
-        return self._write_reg(REG["adaptive_speed"], speed)
+        """设自适应夹取速度(200~1500)：写 AO speed 通道。"""
+        return self._set_speed(speed)
 
     def set_target_force(self, force: int) -> int:
-        """设目标夹持力(0~100)：写 0x0012。"""
-        return self._write_reg(REG["target_force"], force)
+        return self._unsupported("set_target_force")
 
     def set_control_mode(self, mode: int) -> int:
-        """切控制模式(0自适应/1力位)：写 0x000E。"""
-        return self._write_reg(REG["control_mode"], mode)
+        return self._unsupported("set_control_mode")
 
     def set_force_position_speed(self, speed: int) -> int:
-        """设力位速度(200~1500)：写 0x000F。"""
-        return self._write_reg(REG["force_pos_speed"], speed)
+        return self._unsupported("set_force_position_speed")
 
     def set_force_position_target(self, position: int) -> int:
-        """设力位目标位置(0~1000)：写 0x0010。"""
-        return self._write_reg(REG["force_pos_target"], position)
+        return self._unsupported("set_force_position_target")
+
+    def _unsupported(self, name: str) -> int:
+        self._warn_once(
+            f"unsupported-{name}",
+            f"[gripper] {name} 需要额外的扩展 IO 通道（当前从站未配置），返回 -1",
+        )
+        return -1
 
     # ---------- 读接口 ----------
     def _read_force(self, addr: int):
-        """读单轴力(0x0000~0x0002，16 位有符号)。"""
-        v = self._read_reg(addr)
-        if v is None:
-            return None
-        return v - 0x10000 if v >= 0x8000 else v
+        """三维力寄存器没有扩展 IO 通道，恒返回 None。"""
+        return self._read_reg(addr)
 
     def read_force_fx(self): return self._read_force(REG["force_fx"])
     def read_force_fy(self): return self._read_force(REG["force_fy"])
@@ -274,22 +251,21 @@ class JakaGripper:
     def read_eeprom_enabled(self):   return self._read_reg(REG["eeprom_enabled"])
     def read_error_flags(self):      return self._read_reg(REG["error_flags"])
 
-    def read_grip_count(self) -> int:
-        lo, hi = self._read_regs(REG["grip_count"], 2)
-        if lo is None or hi is None:
-            return None
-        return (hi << 16) | lo  # 手册称小端序(低字在前)
+    def read_grip_count(self):
+        return None
 
-    def read_baudrate(self) -> int:
-        lo, hi = self._read_regs(REG["baudrate"], 2)
-        if lo is None or hi is None:
-            return None
-        return (hi << 16) | lo  # 手册称小端序(低字在前)
+    def read_baudrate(self):
+        return None
 
-    def read_factory_number(self) -> str:
-        regs = self._read_regs(REG["factory_number"], 6, SIG_INPUT)
-        if any(r is None for r in regs):
+    def read_factory_number(self):
+        return None
+
+    # ---------- 便利接口 ----------
+    def opening_m(self, stroke_m: float = 0.098):
+        """开口宽度（米）。位置是闭合量，故 opening = (1000 − pos)/1000 × 行程。"""
+        pos = self.read_position()
+        if pos is None:
             return None
-        length = regs[0]
-        raw = bytes(r & 0xFF for r in regs[1:])
-        return raw[:length].decode("ascii", errors="replace")
+        if pos <= 1000:
+            return max(0.0, min(1.0, (1000 - pos) / 1000.0)) * stroke_m
+        return None

@@ -96,6 +96,9 @@ def activate():
             linear_speed_mm_s=float(_cfg.get("linear_speed_mm_s", 100.0)),
             gripper_force=int(_cfg.get("gripper_force", 50)),
             gripper_speed=int(_cfg.get("gripper_speed", 1100)),
+            gripper_submodule_id=int(_cfg.get("gripper_submodule_id", 54052)),
+            sdk_user=str(_cfg.get("sdk_user", "jaka_sdk")),
+            sdk_password=str(_cfg.get("sdk_password", "REDACTED")),
             reach_mse_threshold_deg2=float(_cfg.get("reach_mse_threshold_deg2", 1.0)),
             move_timeout_s=float(_cfg.get("move_timeout_s", 10.0)),
         )

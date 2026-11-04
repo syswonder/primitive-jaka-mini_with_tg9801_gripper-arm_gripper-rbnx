@@ -30,10 +30,10 @@ JOINT_NAMES = [f"joint_{i}" for i in range(1, 7)]
 GRIPPER_JOINT_NAME = "gripper_joint"
 # TG-9801 total stroke (datasheet: 可调行程 0~98 mm)
 GRIPPER_STROKE_M = 0.098
-# A gripper position read costs ~1.3 s (single-entry RS485 signal-table path,
-# see gripper.JakaGripper._read_reg), so the 50 Hz state loop serves a cached
-# value and re-reads at most this often.
-GRIPPER_READ_INTERVAL_S = 2.0
+# Gripper feedback now comes from the controller's extended-IO channels (one
+# gRPC round trip, ~10 ms), so the 50 Hz state loop can refresh it often while
+# still leaving the Modbus bus alone between reads.
+GRIPPER_READ_INTERVAL_S = 0.2
 
 # JAKA Mini soft limits (user manual table 5-1, degrees). Verified against
 # the real arm before enabling motion; placeholder limits are from Zu3 docs.
@@ -60,6 +60,9 @@ class JakaDriver:
         gripper_speed: int = 1100,
         reach_mse_threshold_deg2: float = 1.0,
         move_timeout_s: float = 10.0,
+        gripper_submodule_id: int = 54052,
+        sdk_user: str = "jaka_sdk",
+        sdk_password: str = "",
     ):
         self._ip = ip
         self._joint_speed_rad_s = float(joint_speed_rad_s)
@@ -68,6 +71,9 @@ class JakaDriver:
         self._gripper_speed = int(gripper_speed)
         self._reach_mse_threshold_deg2 = float(reach_mse_threshold_deg2)
         self._move_timeout_s = float(move_timeout_s)
+        self._gripper_submodule_id = int(gripper_submodule_id)
+        self._sdk_user = str(sdk_user)
+        self._sdk_password = str(sdk_password)
         self._lock = threading.RLock()
         self._rc = None
         self._gripper = None
@@ -80,23 +86,45 @@ class JakaDriver:
     # ---------- lifecycle ----------
 
     def connect(self) -> None:
-        """Login, power on, enable, and bring up the RS485 gripper channel."""
+        """gRPC login, power on, enable, and wait for the extended-IO channels.
+
+        The extended-IO calls only exist on a gRPC session: with the legacy
+        ``login()`` the SDK aborts the process ("Type is not convertible to
+        int") the moment ``is_extio_running()``/``get_analog_input()`` is used.
+        Without an SDK password the session falls back to legacy, so the
+        gripper is left unconnected instead of crashing later.
+        """
         with self._lock:
             if self._connected:
                 return
             self._rc = jkrc.RC(self._ip)
-            ret = self._rc.login()
+            if self._sdk_password:
+                ret = self._rc.login(1, self._sdk_user, self._sdk_password)
+            else:
+                ret = self._rc.login()
             if ret[0] != 0:
                 raise ConnectionError(f"JAKA login failed ({self._ip}): {ret}")
-            self._gripper = JakaGripper(robot=self._rc)
-            self._gripper.power_on()  # re-arms RS485 channel after power cycle
+
+            if self._sdk_password:
+                self._gripper = JakaGripper(
+                    robot=self._rc, submodule_id=self._gripper_submodule_id)
+                self._gripper.power_on()  # waits for the ext-IO current read
+            else:
+                self._gripper = None
+                print("[jaka_arm] no sdk_password: legacy session, the ext-IO "
+                      "gripper is disabled (its SDK calls abort on legacy)",
+                      flush=True)
             self._rc.enable_robot()
-            self._gripper.set_target_force(self._gripper_force)
+            # gripper_force is part of the TG-9801 adaptive mode only; the
+            # extended-IO slave currently exposes speed/action, not force.
+            self._gripper_force = self._gripper_force
 
             # Cache travel endpoints for opening normalization; controller
             # reads are occasionally bogus (0/0), fall back to measured travel.
-            open_pos = self._gripper.read_open_position()
-            close_pos = self._gripper.read_close_position()
+            open_pos = close_pos = None
+            if self._gripper is not None:
+                open_pos = self._gripper.read_open_position()
+                close_pos = self._gripper.read_close_position()
             endpoints_valid = (
                 open_pos is not None and close_pos is not None
                 and open_pos != close_pos
@@ -163,13 +191,11 @@ class JakaDriver:
     def get_gripper_open_m(self) -> float | None:
         """Last known opening in m, re-read at most every GRIPPER_READ_INTERVAL_S.
 
-        The 50 Hz state loop must not read every cycle: a read stalls ~1.3 s
-        and keeps the half-duplex bus busy, risking dropped grip/release
-        frames. Between reads the previous value is served; a failed attempt
-        (None) also waits a full interval before retrying.
+        Between reads the previous value is served; a failed attempt (None)
+        also waits a full interval before retrying.
         """
         with self._lock:
-            if not self._connected:
+            if not self._connected or self._gripper is None:
                 return None
             now = time.monotonic()
             if (self._gripper_open_m_mono is None
@@ -261,7 +287,7 @@ class JakaDriver:
     def set_gripper_open_m(self, open_m: float) -> bool:
         """TG-9801 adaptive mode is binary: >= half stroke = release, else grip."""
         with self._lock:
-            if not self._connected:
+            if not self._connected or self._gripper is None:
                 return False
             if open_m >= 0.5 * GRIPPER_STROKE_M:
                 return self._gripper.release(self._gripper_speed) == 0

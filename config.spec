@@ -25,6 +25,24 @@ config:
   # TG-9801 adaptive grip/release speed.
   gripper_speed: 1100
 
+  # string, default: jaka_sdk.
+  # SDK account used for the gRPC login. The extended-IO gripper channels only
+  # exist on a gRPC session.
+  sdk_user: jaka_sdk
+
+  # string, default: REDACTED (factory account on the Lumi controller).
+  # Leave empty to fall back to the legacy login(); the gripper is then
+  # disabled, because its ext-IO SDK calls abort the process on a legacy
+  # session.
+  sdk_password: REDACTED
+
+  # int, default: 54052.
+  # Coboπ Modbus-slave submodule id that backs the gripper's extended-IO
+  # channels (settings -> hardware & communication -> Modbus -> the TIO Modbus
+  # RTU slave). The slave must be running and the controller must be in Remote
+  # control source, otherwise every write returns 10007 and reads 10003.
+  gripper_submodule_id: 54052
+
   # float, deg^2, default: 1.0.
   # Mean-squared joint error below which a move counts as reached.
   reach_mse_threshold_deg2: 1.0
