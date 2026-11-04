@@ -73,17 +73,33 @@ REG = {
 # 扩展 IO 通道映射（Coboπ → 设置/硬件与通信/Modbus 设置 里那个从站）
 # 只列当前从站实际配了的通道；改配置时同步改这里。
 EXTIO_AI = {
-    "position": 0,   # 位置（闭合量）
-    "current": 1,    # 电流 mA
-    "state": 2,      # 夹持状态
+    "position": 0,        # 0x0008 位置（闭合量）
+    "current": 1,         # 0x0009 电流 mA
+    "state": 2,           # 0x0006 夹持状态
+    "force_fx": 3,        # 0x0000 力 Fx（有符号，按 uint16 读后转）
+    "force_fy": 4,        # 0x0001 力 Fy
+    "force_fz": 5,        # 0x0002 力 Fz
+    "hardness": 6,        # 0x0007 硬度
+    "error_flags": 7,     # 0x0023 错误标志
+    "force_pos_state": 8, # 0x002F 力位状态
+    "grip_count_lo": 9,   # 0x0019 夹取次数低 16 位
+    "grip_count_hi": 10,  # 0x001A 夹取次数高 16 位
 }
 EXTIO_AO = {
-    "adaptive_speed": 0,  # 自适应速度
-    "action": 1,          # 动作 1=夹取 0=松开
+    "adaptive_speed": 0,   # 0x000A 自适应速度
+    "action": 1,           # 0x000B 动作 1=夹取 0=松开
+    "control_mode": 2,     # 0x000E 控制模式 0=自适应 1=力位
+    "force_pos_speed": 3,  # 0x000F 力位速度
+    "force_pos_target": 4, # 0x0010 力位目标位置
+    "target_force": 5,     # 0x0012 目标力
+    "follow_speed": 6,     # 0x001B 跟随速度
+    "open_position": 7,    # 0x002D 张开位置
+    "close_position": 8,   # 0x002E 闭合位置
 }
 
-# 寄存器地址 → AI 通道，由 EXTIO_AI 反推
-_ADDR_TO_AI = {REG[name]: idx for name, idx in EXTIO_AI.items()}
+# 寄存器地址 → 扩展 IO 通道，由上面两张表反推
+_ADDR_TO_AI = {REG[name]: idx for name, idx in EXTIO_AI.items() if name in REG}
+_ADDR_TO_AO = {REG[name]: idx for name, idx in EXTIO_AO.items() if name in REG}
 
 
 class JakaGripper:
@@ -158,12 +174,14 @@ class JakaGripper:
         return self._read_ai(idx)
 
     def _write_reg(self, addr: int, value: int) -> int:
-        """单寄存器写。只有动作寄存器走扩展 IO，其余通道未配置。"""
-        self._warn_once(
-            f"wr-{addr}",
-            f"[gripper] 寄存器 0x{addr:04X} 没有可写的扩展 IO 通道，写被忽略",
-        )
-        return -1
+        idx = _ADDR_TO_AO.get(addr)
+        if idx is None:
+            self._warn_once(
+                f"wr-{addr}",
+                f"[gripper] 寄存器 0x{addr:04X} 没有可写的扩展 IO 通道，写被忽略",
+            )
+            return -1
+        return self._write_ao(idx, value)
 
     # ---------- 运动接口 ----------
     def _set_speed(self, speed: int) -> int:
@@ -186,8 +204,23 @@ class JakaGripper:
             return code
         return self._set_action(0)
 
-    def force_position_control(self, speed: int, position: int) -> int:
-        return self._unsupported("force_position_control")
+    def force_position_control(self, speed: int, position: int,
+                               force: int = None) -> int:
+        """力位控制：切模式=1 → 写速度/目标位置/目标力 → 触发夹取。"""
+        code = self._write_reg(REG["control_mode"], 1)
+        if code != 0:
+            return code
+        code = self._write_reg(REG["force_pos_speed"], int(speed))
+        if code != 0:
+            return code
+        code = self._write_reg(REG["force_pos_target"], int(position))
+        if code != 0:
+            return code
+        if force is not None:
+            code = self._write_reg(REG["target_force"], int(force))
+            if code != 0:
+                return code
+        return self._set_action(1)
 
     def follow_control(self, speed: int, position: int) -> int:
         return self._unsupported("follow_control")
@@ -205,16 +238,18 @@ class JakaGripper:
         return self._set_speed(speed)
 
     def set_target_force(self, force: int) -> int:
-        return self._unsupported("set_target_force")
+        """目标力(0~100%)：写 AO target_force 通道。"""
+        return self._write_reg(REG["target_force"], int(force))
 
     def set_control_mode(self, mode: int) -> int:
-        return self._unsupported("set_control_mode")
+        """控制模式 0=自适应 1=力位。"""
+        return self._write_reg(REG["control_mode"], int(mode))
 
     def set_force_position_speed(self, speed: int) -> int:
-        return self._unsupported("set_force_position_speed")
+        return self._write_reg(REG["force_pos_speed"], int(speed))
 
     def set_force_position_target(self, position: int) -> int:
-        return self._unsupported("set_force_position_target")
+        return self._write_reg(REG["force_pos_target"], int(position))
 
     def _unsupported(self, name: str) -> int:
         self._warn_once(
@@ -225,8 +260,11 @@ class JakaGripper:
 
     # ---------- 读接口 ----------
     def _read_force(self, addr: int):
-        """三维力寄存器没有扩展 IO 通道，恒返回 None。"""
-        return self._read_reg(addr)
+        """三维力寄存器按有符号 16 位解释。"""
+        raw = self._read_reg(addr)
+        if raw is None:
+            return None
+        return raw - 0x10000 if raw >= 0x8000 else raw
 
     def read_force_fx(self): return self._read_force(REG["force_fx"])
     def read_force_fy(self): return self._read_force(REG["force_fy"])
@@ -252,7 +290,11 @@ class JakaGripper:
     def read_error_flags(self):      return self._read_reg(REG["error_flags"])
 
     def read_grip_count(self):
-        return None
+        lo = self._read_ai(EXTIO_AI["grip_count_lo"])
+        hi = self._read_ai(EXTIO_AI["grip_count_hi"])
+        if lo is None or hi is None:
+            return None
+        return (int(hi) << 16) | int(lo)
 
     def read_baudrate(self):
         return None

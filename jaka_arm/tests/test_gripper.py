@@ -66,13 +66,25 @@ class TestGripperReads(unittest.TestCase):
              (IO_EXTEND, EXTIO_AI["state"], SUB)],
         )
 
-    def test_unmapped_registers_return_none(self):
+    def test_write_only_registers_return_none(self):
         rc = FakeRC(ai={0: 500})
         g = JakaGripper(robot=rc)
-        self.assertIsNone(g.read_force_fx())
-        self.assertIsNone(g.read_open_position())
+        self.assertIsNone(g.read_open_position())   # 只配了 AO
         self.assertIsNone(g.read_close_position())
+        self.assertIsNone(g.read_protocol())
         self.assertEqual(rc.reads, [])  # no bus traffic for unknown channels
+
+    def test_force_reads_are_signed(self):
+        rc = FakeRC(ai={EXTIO_AI["force_fx"]: 0xFFFE,
+                        EXTIO_AI["force_fy"]: 12})
+        g = JakaGripper(robot=rc)
+        self.assertEqual(g.read_force_fx(), -2)
+        self.assertEqual(g.read_force_fy(), 12)
+
+    def test_grip_count_combines_two_channels(self):
+        rc = FakeRC(ai={EXTIO_AI["grip_count_lo"]: 15,
+                        EXTIO_AI["grip_count_hi"]: 0})
+        self.assertEqual(JakaGripper(robot=rc).read_grip_count(), 15)
 
     def test_read_error_returns_none(self):
         g = JakaGripper(robot=FakeRC(read_code=10003))
@@ -119,14 +131,26 @@ class TestGripperWrites(unittest.TestCase):
         g = JakaGripper(robot=HalfFail())
         self.assertEqual(g.grip(1000), 10007)
 
-    def test_unsupported_setters_return_minus_one(self):
+    def test_extended_setters_write_their_channels(self):
+        rc = FakeRC()
+        g = JakaGripper(robot=rc)
+        self.assertEqual(g.set_target_force(50), 0)
+        self.assertEqual(rc.writes[-1],
+                         (IO_EXTEND, EXTIO_AO["target_force"], 50.0, SUB))
+        self.assertEqual(g.set_control_mode(1), 0)
+        self.assertEqual(rc.writes[-1],
+                         (IO_EXTEND, EXTIO_AO["control_mode"], 1.0, SUB))
+        self.assertEqual(g.set_force_position_target(400), 0)
+        self.assertEqual(rc.writes[-1],
+                         (IO_EXTEND, EXTIO_AO["force_pos_target"], 400.0, SUB))
+
+    def test_maintenance_commands_stay_unsupported(self):
         g = JakaGripper(robot=FakeRC())
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            self.assertEqual(g.set_target_force(50), -1)
-            self.assertEqual(g.set_control_mode(1), -1)
             self.assertEqual(g.calibrate_fingertip(), -1)
-        self.assertEqual(buf.getvalue().count("set_target_force"), 1)  # warn once
+            self.assertEqual(g.clear_fingertip_zero(), -1)
+        self.assertEqual(buf.getvalue().count("calibrate_fingertip"), 1)
 
 
 class TestGripperLifecycle(unittest.TestCase):

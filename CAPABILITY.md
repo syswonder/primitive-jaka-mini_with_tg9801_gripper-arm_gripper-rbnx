@@ -21,10 +21,18 @@ the deploy instance `name` (default `jaka_arm`).
   one gRPC round trip), so `gripper_joint` refreshes at 5 Hz over a cached
   value. The raw position register is a **closure** amount (1000 = closed,
   0 = open); the provider inverts it against the travel endpoints. Writes go to
-  the analog outputs (speed + action). The Coboπ slave must be running
+  the analog outputs. The Coboπ slave must be running
   (`983126`), the controller must be in **Remote** control source (`10007`), and
   the session must be gRPC: with legacy `login()` the SDK aborts on the first
   ext-IO call. Arm joints are unaffected.
+- The slave carries the **full TG-9801 register set**: 11 analog inputs
+  (position/current/state, force `Fx/Fy/Fz`, hardness, error flags,
+  force-position state, 32-bit grip count) and 9 analog outputs (adaptive
+  speed/action, control mode, force-position speed/target, target force, follow
+  speed, open/close position). `EXTIO_AI` / `EXTIO_AO` in `jaka_arm/gripper.py`
+  are authoritative: if the slave is re-configured in Coboπ, both sides must be
+  changed together. Maintenance registers (fingertip calibration/zero, eeprom)
+  are deliberately not mapped.
 
 ## Capabilities
 

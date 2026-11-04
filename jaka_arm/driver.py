@@ -119,24 +119,12 @@ class JakaDriver:
             # extended-IO slave currently exposes speed/action, not force.
             self._gripper_force = self._gripper_force
 
-            # Cache travel endpoints for opening normalization; controller
-            # reads are occasionally bogus (0/0), fall back to measured travel.
-            open_pos = close_pos = None
-            if self._gripper is not None:
-                open_pos = self._gripper.read_open_position()
-                close_pos = self._gripper.read_close_position()
-            endpoints_valid = (
-                open_pos is not None and close_pos is not None
-                and open_pos != close_pos
-                and 0 <= open_pos <= 1000 and 0 <= close_pos <= 1000
-            )
-            if endpoints_valid:
-                self._gripper_open_pos = open_pos
-                self._gripper_close_pos = close_pos
+            # Travel endpoints are fixed for the TG-9801 and the registers that
+            # hold them (0x002D/0x002E) are write-only on the extended-IO slave,
+            # so there is nothing to read back: close = 1000, open = 0.
             print(
                 f"[jaka_arm] TG-9801 travel: close={self._gripper_close_pos} "
-                f"open={self._gripper_open_pos}"
-                f"{'' if endpoints_valid else ' (fallback, reads invalid)'}",
+                f"open={self._gripper_open_pos}",
                 flush=True,
             )
             self._connected = True
