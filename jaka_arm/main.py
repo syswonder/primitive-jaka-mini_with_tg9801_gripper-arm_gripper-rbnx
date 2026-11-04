@@ -151,6 +151,10 @@ def activate():
             gripper_submodule_id=int(_cfg.get("gripper_submodule_id", 54052)),
             sdk_user=str(_cfg.get("sdk_user", "jaka_sdk")),
             sdk_password=str(_cfg.get("sdk_password", "REDACTED")),
+            web_user=str(_cfg.get("web_user", "jakazu7admin")),
+            web_password=str(_cfg.get("web_password", "")),
+            extio_autostart=bool(_cfg.get("extio_autostart", True)),
+            extio_start_timeout_s=float(_cfg.get("extio_start_timeout_s", 10.0)),
             reach_mse_threshold_deg2=float(_cfg.get("reach_mse_threshold_deg2", 1.0)),
             move_timeout_s=float(_cfg.get("move_timeout_s", 10.0)),
         )

@@ -28,6 +28,22 @@ config:
   # string, default: jaka_sdk.
   # SDK account used for the gRPC login. The extended-IO gripper channels only
   # exist on a gRPC session.
+  # str, default: jakazu7admin. App account the provider logs in with when it
+  # has to start the controller's extended-IO slave by itself.
+  web_user: jakazu7admin
+
+  # str, default: "". App password for `web_user`. Empty disables automatic
+  # slave recovery (see extio_autostart) and keeps the credential out of files.
+  web_password: ""
+
+  # bool, default: true. When the extended-IO slave is down at connect time,
+  # capture the control source, start the slave and hand control back. With
+  # this false the provider fails connect instead of trying.
+  extio_autostart: true
+
+  # float, s, default: 10.0. How long to wait for the slave to report running.
+  extio_start_timeout_s: 10.0
+
   sdk_user: jaka_sdk
 
   # string, default: REDACTED (factory account on the Lumi controller).

@@ -74,6 +74,24 @@ semantics the device cannot deliver.
   stationary jaw reads `STOPPED` without claiming arrival; `stamp` is the
   acquisition instant, not the publish instant.
 
+### Extended-IO slave recovery
+
+The slave is a controller feature, not an SDK one: while it is down every
+analog call returns `-61` and the gripper keeps serving its last cached value,
+so the provider no longer fails silently.
+
+On connect, if `is_extio_running()` is false it logs into the App
+(`web_user` / `web_password`), captures the control source, posts
+`MSGID_SETEXTIOMODE` with `{submod, tarmode: 1}` — the App's own payload, since
+the bare `intid` form is silently ignored — waits for the slave to report
+running, hands the control source back to Remote, and only then enables the arm.
+
+The controller enforces two preconditions: the arm must be powered and
+**disarmed** (the App refuses to start a slave while the arm is enabled), and
+the App session must be free (a logged-in App makes the login fail with 917508).
+`extio_autostart: false` disables the attempt; connect then fails with the
+reason instead of guessing.
+
 ## Command semantics
 
 - `joint_command`: subset of `joint_1..joint_6` + optional `gripper_joint`

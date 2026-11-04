@@ -18,6 +18,8 @@ import time
 
 import numpy as np
 
+from . import extio_bringup
+
 from . import jaka_sdk  # noqa: F401  (platform loader; must precede jkrc)
 import jkrc  # noqa: E402
 
@@ -74,6 +76,10 @@ class JakaDriver:
         gripper_submodule_id: int = 54052,
         sdk_user: str = "jaka_sdk",
         sdk_password: str = "",
+        web_user: str = "",
+        web_password: str = "",
+        extio_autostart: bool = True,
+        extio_start_timeout_s: float = 10.0,
     ):
         self._ip = ip
         self._joint_speed_rad_s = float(joint_speed_rad_s)
@@ -85,6 +91,10 @@ class JakaDriver:
         self._gripper_submodule_id = int(gripper_submodule_id)
         self._sdk_user = str(sdk_user)
         self._sdk_password = str(sdk_password)
+        self._web_user = str(web_user)
+        self._web_password = str(web_password)
+        self._extio_autostart = bool(extio_autostart)
+        self._extio_start_timeout_s = float(extio_start_timeout_s)
         self._lock = threading.RLock()
         self._rc = None
         self._gripper = None
@@ -125,6 +135,28 @@ class JakaDriver:
                 self._gripper = None
                 print("[jaka_arm] no sdk_password: legacy session, the ext-IO "
                       "gripper is disabled (its SDK calls abort on legacy)",
+                      flush=True)
+            # The slave is a controller feature, not an SDK one: when it is
+            # down every analog call returns -61 and the gripper silently keeps
+            # serving its last cached value. Recover it (or fail loudly) while
+            # the arm is still powered-but-disarmed, which is the state the
+            # controller requires to start a slave.
+            if self._gripper is not None and not self._gripper.extio_running():
+                if not self._extio_autostart:
+                    raise ConnectionError(
+                        f"extended-IO slave {self._gripper_submodule_id} is not "
+                        "running and extio_autostart is false; start it in the "
+                        "App (Modbus settings) or enable extio_autostart")
+                ok, reason = extio_bringup.ensure_running(
+                    self._rc, self._ip, self._gripper_submodule_id,
+                    self._web_user, self._web_password,
+                    self._extio_start_timeout_s)
+                if not ok:
+                    raise ConnectionError(
+                        f"extended-IO slave {self._gripper_submodule_id} is not "
+                        f"running and could not be started: {reason}")
+                print(f"[jaka_arm] extended-IO slave "
+                      f"{self._gripper_submodule_id} started by the provider",
                       flush=True)
             self._rc.enable_robot()
             # gripper_force is part of the TG-9801 adaptive mode only; the
