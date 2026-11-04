@@ -6,12 +6,32 @@ import unittest
 
 import numpy as np
 
+from jaka_arm import driver
 from jaka_arm.driver import (
     JakaDriver,
     ABS,
     GRIPPER_READ_INTERVAL_S,
     GRIPPER_STROKE_M,
 )
+
+
+class TestJointUnits(unittest.TestCase):
+    """gripper_joint carries per-finger travel; the device reports the gap."""
+
+    def test_closed_maps_to_zero(self):
+        self.assertEqual(driver.joint_travel_from_gap(0.0), 0.0)
+        self.assertEqual(driver.gap_from_joint_travel(0.0), 0.0)
+
+    def test_full_gap_halves_to_the_urdf_limit(self):
+        self.assertAlmostEqual(
+            driver.joint_travel_from_gap(driver.GRIPPER_STROKE_M), 0.049, places=6)
+        self.assertAlmostEqual(driver.GRIPPER_TRAVEL_M, 0.049, places=6)
+
+    def test_round_trip_is_lossless(self):
+        for gap in (0.0, 0.0123, 0.06, 0.098):
+            self.assertAlmostEqual(
+                driver.gap_from_joint_travel(driver.joint_travel_from_gap(gap)),
+                gap, places=12)
 
 
 class FakeGripper:

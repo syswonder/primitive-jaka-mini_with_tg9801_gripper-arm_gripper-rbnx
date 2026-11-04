@@ -4,7 +4,8 @@
 
 Owns `robonix/primitive/arm/*`:
 
-  joint_states  topic_out  ROS 2 /jaka/joint_states (arm joints rad + gripper m)
+  joint_states  topic_out  ROS 2 /jaka/joint_states (arm joints rad + gripper m;
+                gripper_joint is per-finger travel 0-0.049, matching the URDF)
 
 Standard gripper contracts (see CAPABILITY.md):
 
@@ -43,6 +44,9 @@ from .driver import (
     JOINT_NAMES,
     GRIPPER_JOINT_NAME,
     GRIPPER_STROKE_M,
+    GRIPPER_TRAVEL_M,
+    gap_from_joint_travel,
+    joint_travel_from_gap,
 )
 
 # One provider owns both families: robonix/primitive/arm/* and gripper/*.
@@ -228,6 +232,7 @@ def _home_before_shutdown() -> None:
     try:
         # Open first (drops any held object); a failed release is logged but
         # does not block the homing move.
+        # set_gripper_open_m takes the two-finger gap, so pass the full stroke.
         if not _driver.set_gripper_open_m(GRIPPER_STROKE_M):
             print("[jaka_arm] shutdown: gripper open failed", flush=True)
         if not _driver.move_joints_rad(target):
@@ -352,15 +357,17 @@ def _exec_joint_command(msg: JointState) -> None:
         print("[jaka_arm] joint_command: no current joint feedback", flush=True)
         return
     target = dict(zip(JOINT_NAMES, current, strict=True))
-    gripper_open_m = None
+    gripper_travel_m = None
     for name, value in zip(names, positions, strict=True):
         if name == GRIPPER_JOINT_NAME:
-            gripper_open_m = float(max(0.0, min(float(value), GRIPPER_STROKE_M)))
+            # joint_command carries per-finger travel (the URDF unit); the
+            # driver below wants the two-finger gap.
+            gripper_travel_m = float(max(0.0, min(float(value), GRIPPER_TRAVEL_M)))
         else:
             target[name] = float(value)
 
-    if gripper_open_m is not None:
-        _driver.set_gripper_open_m(gripper_open_m)
+    if gripper_travel_m is not None:
+        _driver.set_gripper_open_m(gap_from_joint_travel(gripper_travel_m))
     if not _driver.move_joints_rad([target[n] for n in JOINT_NAMES]):
         print("[jaka_arm] joint_command: joint move failed", flush=True)
 
@@ -416,7 +423,8 @@ def _state_loop() -> None:
         if joints is None:
             continue
         if gripper is not None:
-            _last_gripper_open_m = gripper
+            # gripper_joint carries per-finger travel, not the two-finger gap.
+            _last_gripper_open_m = joint_travel_from_gap(gripper)
         state = JointState()
         state.header.frame_id = str(_cfg.get("base_frame", "world"))
         if _last_gripper_open_m is None:

@@ -14,9 +14,15 @@ the deploy instance `name` (default `jaka_arm`).
   **base frame**; positions are the controller's configured TCP pose. The TCP
   definition lives on the controller (user-configured), not in this package.
 - Arm joints are revolute, in **rad**, names `joint_1`..`joint_6`.
-- The gripper is a prismatic joint `gripper_joint` in **m** (0 = closed,
-  `0.098` = fully open; TG-9801 stroke). Adaptive mode is binary: values
-  below half stroke close to the configured force, at/above half stroke open.
+- The gripper is a prismatic joint `gripper_joint` in **m**, measuring
+  **per-finger travel**: 0 = closed, `0.049` = fully open. Each finger moves
+  49 mm, so the two-finger gap is 98 mm. This matches the URDF joint limits,
+  where `gripper_joint_r` mirrors `gripper_joint` on the opposite axis.
+- `robonix/primitive/gripper/state.opening_width_m` reports the **two-finger
+  gap** instead (0-0.098), because that is what the device register holds.
+  The relation is `opening_width_m = 2 x gripper_joint`; the provider converts
+  at both boundaries. Adaptive mode is binary: values below half travel close
+  to the configured force, at/above half travel open.
 - Gripper feedback comes from the extended-IO analog inputs (`get_analog_input`,
   one gRPC round trip), so `gripper_joint` refreshes at 5 Hz over a cached
   value. The raw position register is a **closure** amount (1000 = closed,

@@ -29,7 +29,18 @@ JOINT_COUNT = 6
 JOINT_NAMES = [f"joint_{i}" for i in range(1, 7)]
 GRIPPER_JOINT_NAME = "gripper_joint"
 # TG-9801 total stroke (datasheet: 可调行程 0~98 mm)
-GRIPPER_STROKE_M = 0.098
+GRIPPER_STROKE_M = 0.098              # two-finger gap: device and contract unit
+GRIPPER_TRAVEL_M = GRIPPER_STROKE_M / 2  # 0.049: per-finger travel, the URDF joint unit
+
+
+def joint_travel_from_gap(gap_m: float) -> float:
+    """Convert a two-finger gap to the per-finger travel a URDF joint carries."""
+    return float(gap_m) / 2.0
+
+
+def gap_from_joint_travel(travel_m: float) -> float:
+    """Convert a per-finger travel back to the two-finger gap."""
+    return float(travel_m) * 2.0
 # Gripper feedback now comes from the controller's extended-IO channels (one
 # gRPC round trip, ~10 ms), so the 50 Hz state loop can refresh it often while
 # still leaving the Modbus bus alone between reads.
