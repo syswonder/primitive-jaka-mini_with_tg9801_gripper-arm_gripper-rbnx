@@ -42,6 +42,31 @@ the deploy instance `name` (default `jaka_arm`).
 | `robonix/primitive/arm/end_pose` | out | `/jaka/end_pose` | ~50 Hz, base frame |
 | `robonix/primitive/arm/joint_command` | in | `/jaka/joint_command` | **position-only write**; `velocity/effort` ignored, speed comes from config |
 | `robonix/primitive/arm/pos_command` | in | `/jaka/pos_command` | IK on provider: linear move, falls back to controller IK + joint move |
+| `robonix/primitive/gripper/state` | out | `/jaka/gripper/state` | `GripperState`; one message per acquisition (~5 Hz) |
+| `robonix/primitive/gripper/info` | rpc | `/jaka/gripper/info` | `GetGripperInfo`; static metadata |
+| `robonix/primitive/gripper/grip` | rpc | `/jaka/gripper/grip` | `Grip`; adaptive close |
+| `robonix/primitive/gripper/open` | rpc | `/jaka/gripper/open` | `Open`; drive to the open endpoint |
+
+`gripper/move` and `gripper/stop` are **not** declared: the TG-9801 has no
+absolute-width command and no halt command, so advertising them would promise
+semantics the device cannot deliver.
+
+### Gripper service semantics
+
+- `open` accepts `relative_speed` only: `0` means the configured
+  `gripper_speed`, `(0,1]` maps onto the device's 200-1500 range.
+- `grip` accepts the **adaptive form only**. `relative_effort > 0` is rejected
+  with `ok=false` because the closing force is not addressable in adaptive mode
+  and no per-face newton range is documented; `expected_object_width_valid=true`
+  is rejected because width-targeted closing would need move-style motion.
+- `info` consequently reports `grip_effort_configurable=false`,
+  `gripping_force_range_valid=false`, `grip_with_expected_object_width_supported=false`
+  and `move_speed_configurable=false`, while advertising the 0-0.098 m width
+  range and both speed flags.
+- `state.grasp_state` comes from the device holding register (0x0006);
+  `motion_state` is inferred from travel between two acquisitions, so a
+  stationary jaw reads `STOPPED` without claiming arrival; `stamp` is the
+  acquisition instant, not the publish instant.
 
 ## Command semantics
 

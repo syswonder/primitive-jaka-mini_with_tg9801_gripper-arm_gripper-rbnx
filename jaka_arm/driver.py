@@ -81,6 +81,7 @@ class JakaDriver:
         self._gripper_open_pos = 0      # fallback: 0 = open
         self._gripper_open_m = None     # cached reading (see get_gripper_open_m)
         self._gripper_open_m_mono = None
+        self._gripper_state = None      # raw holding-state register (0/1)
         self._connected = False
 
     # ---------- lifecycle ----------
@@ -176,6 +177,28 @@ class JakaDriver:
                 return None
             return [float(a) for a in ret[1]]
 
+    def _refresh_gripper_locked(self) -> None:
+        """Acquire one gripper reading (opening + holding state) under the lock."""
+        pos = self._gripper.read_position()
+        state = self._gripper.read_state()
+        self._gripper_open_m_mono = time.monotonic()
+        self._gripper_state = state
+        if pos is None:
+            return
+        lo, hi = self._gripper_close_pos, self._gripper_open_pos
+        if hi == lo:
+            value = 0.0
+        else:
+            value = (pos - lo) / (hi - lo)  # 1 = fully open (both travel dirs)
+        # + 0.0 turns a negative zero into +0.0: valid widths are nonnegative.
+        self._gripper_open_m = float(np.clip(value, 0, 1) + 0.0) * GRIPPER_STROKE_M
+
+    def _maybe_refresh_gripper_locked(self) -> None:
+        if (self._gripper_open_m_mono is None
+                or time.monotonic() - self._gripper_open_m_mono
+                >= GRIPPER_READ_INTERVAL_S):
+            self._refresh_gripper_locked()
+
     def get_gripper_open_m(self) -> float | None:
         """Last known opening in m, re-read at most every GRIPPER_READ_INTERVAL_S.
 
@@ -185,19 +208,21 @@ class JakaDriver:
         with self._lock:
             if not self._connected or self._gripper is None:
                 return None
-            now = time.monotonic()
-            if (self._gripper_open_m_mono is None
-                    or now - self._gripper_open_m_mono >= GRIPPER_READ_INTERVAL_S):
-                pos = self._gripper.read_position()
-                self._gripper_open_m_mono = time.monotonic()
-                if pos is not None:
-                    lo, hi = self._gripper_close_pos, self._gripper_open_pos
-                    if hi == lo:
-                        value = 0.0
-                    else:
-                        value = (pos - lo) / (hi - lo)  # 1 = fully open (both travel dirs)
-                    self._gripper_open_m = float(np.clip(value, 0, 1)) * GRIPPER_STROKE_M
+            self._maybe_refresh_gripper_locked()
             return self._gripper_open_m
+
+    def get_gripper_snapshot(self):
+        """(opening_m, device_state, acquired_monotonic) for gripper/state.
+
+        Both readings come from the same acquisition round, so they share one
+        timestamp. ``device_state`` is the raw holding register (0/1/None).
+        """
+        with self._lock:
+            if not self._connected or self._gripper is None:
+                return None
+            self._maybe_refresh_gripper_locked()
+            return (self._gripper_open_m, self._gripper_state,
+                    self._gripper_open_m_mono)
 
     def get_tcp_pose(self) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
         """TCP pose as ((x, y, z) m, (rx, ry, rz) rad, R = Rz·Ry·Rx order)."""
@@ -272,14 +297,25 @@ class JakaDriver:
             return False
         return self.move_joints_rad([float(np.radians(a)) for a in solution])
 
-    def set_gripper_open_m(self, open_m: float) -> bool:
-        """TG-9801 adaptive mode is binary: >= half stroke = release, else grip."""
+    def grip_with_speed(self, speed: int) -> bool:
+        """Close in adaptive mode at an explicit device speed."""
         with self._lock:
             if not self._connected or self._gripper is None:
                 return False
-            if open_m >= 0.5 * GRIPPER_STROKE_M:
-                return self._gripper.release(self._gripper_speed) == 0
-            return self._gripper.grip(self._gripper_speed) == 0
+            return self._gripper.grip(int(speed)) == 0
+
+    def release_with_speed(self, speed: int) -> bool:
+        """Open in adaptive mode at an explicit device speed."""
+        with self._lock:
+            if not self._connected or self._gripper is None:
+                return False
+            return self._gripper.release(int(speed)) == 0
+
+    def set_gripper_open_m(self, open_m: float) -> bool:
+        """TG-9801 adaptive mode is binary: >= half stroke = release, else grip."""
+        if open_m >= 0.5 * GRIPPER_STROKE_M:
+            return self.release_with_speed(self._gripper_speed)
+        return self.grip_with_speed(self._gripper_speed)
 
     # ---------- internals ----------
 

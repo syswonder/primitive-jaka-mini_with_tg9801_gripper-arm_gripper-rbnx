@@ -26,5 +26,13 @@ capabilities:
     transport: ros2
   - name: robonix/primitive/arm/end_pose
     transport: ros2
+  - name: robonix/primitive/gripper/state
+    transport: ros2
+  - name: robonix/primitive/gripper/info
+    transport: ros2
+  - name: robonix/primitive/gripper/grip
+    transport: ros2
+  - name: robonix/primitive/gripper/open
+    transport: ros2
 
 depends: []

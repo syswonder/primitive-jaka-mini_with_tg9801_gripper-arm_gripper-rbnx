@@ -15,13 +15,17 @@ from jaka_arm.driver import (
 
 
 class FakeGripper:
-    def __init__(self, pos):
+    def __init__(self, pos, state=0):
         self.pos = pos
+        self.state = state
         self.reads = 0
 
     def read_position(self):
         self.reads += 1
         return self.pos
+
+    def read_state(self):
+        return self.state
 
 
 class FakeRC:
