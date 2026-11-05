@@ -46,11 +46,13 @@ config:
 
   sdk_user: jaka_sdk
 
-  # string, default: REDACTED (factory account on the Lumi controller).
+  # string, required for the gRPC session on the Lumi controller; there is no
+  # built-in default. Keep the value in the machine-local deployment manifest
+  # (gitignored), never in this file.
   # Leave empty to fall back to the legacy login(); the gripper is then
   # disabled, because its ext-IO SDK calls abort the process on a legacy
   # session.
-  sdk_password: REDACTED
+  sdk_password: ""
 
   # int, default: 54052.
   # Coboπ Modbus-slave submodule id that backs the gripper's extended-IO
