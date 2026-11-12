@@ -36,8 +36,15 @@ update_tio_rs_signal 强制轮询」。因此所有读接口都走 _read_reg 逐
 说明：
   · force_position_control 需先 set_control_mode(1) 切到「力位」模式；
     follow_control 需夹爪处于「跟随」模式。
+
+并发（2026-11-12）：一次寄存器读约 1.3 s，其中大部分是等控制器轮询的 sleep。
+若整段读都占着机械臂的 RC 锁，50 Hz 的关节反馈会被拖停 1.3 s。因此锁分两层：
+`_bus_lock` 保证 RS485 总线上的读/写不交错，`_rc_lock`（由 JakaDriver 传入其 RC
+锁）只覆盖单次 SDK 调用，sleep 期间让出，机械臂的反馈读可以插空执行。
 """
+import threading
 import time
+from contextlib import contextmanager
 
 import jkrc
 
@@ -87,10 +94,15 @@ SIG_INPUT = 4     # 输入寄存器(04功能码)
 
 
 class JakaGripper:
-    def __init__(self, robot=None, ip="10.5.5.100", chn=1, slave_id=1, baudrate=115200):
+    def __init__(self, robot=None, ip="10.5.5.100", chn=1, slave_id=1,
+                 baudrate=115200, rc_lock=None):
         self.chn = chn
         self.slave_id = slave_id
         self.baudrate = baudrate
+        # RS485 总线锁：一次读（add→update→read→delete）或一次写独占总线。
+        self._bus_lock = threading.Lock()
+        # 调用方的 RC 锁：只包住单次 SDK 调用，sleep 期间不占。
+        self._rc_lock = rc_lock if rc_lock is not None else threading.RLock()
         self._shared_robot = robot is not None
         if self._shared_robot:
             self.robot = robot
@@ -139,9 +151,16 @@ class JakaGripper:
         self.robot.power_off()
 
     # ---------- 写：透传 Modbus 帧 ----------
+    @contextmanager
+    def _rc_call(self):
+        """单次 SDK 调用占 RC 锁，返回即让出。"""
+        with self._rc_lock:
+            yield
+
     def _send(self, payload: bytes) -> int:
         frame = payload + crc16_modbus(payload)
-        return self.robot.send_tio_rs_command(self.chn, bytearray(frame))[0]
+        with self._bus_lock, self._rc_call():
+            return self.robot.send_tio_rs_command(self.chn, bytearray(frame))[0]
 
     def _write_reg(self, addr: int, value: int) -> int:
         p = bytes([self.slave_id, 0x06]) + addr.to_bytes(2, "big") + value.to_bytes(2, "big")
@@ -179,19 +198,28 @@ class JakaGripper:
         唯一可靠读法：表里只放 1 条 → update_tio_rs_signal 强制轮询 → 读表。
         多条目表的槽位会错位（值张冠李戴）。读后删除条目保持总线安静，
         避免轮询流量与写指令抢 RS485 总线导致写丢帧。
+
+        整段读占 `_bus_lock`（写指令不能插进来抢总线），但两次 sleep 期间
+        不占 `_rc_lock`，机械臂的反馈/运动调用可以插空执行。
         """
-        for _ in range(max(1, retries)):
-            self._add_signal("_rd", addr, sig_type)
-            time.sleep(self._READ_WAIT_ADD)
-            self.robot.update_tio_rs_signal({"sig_name": "_rd", "frequency": 5})
-            time.sleep(self._READ_WAIT_UPDATE)
-            info = self.robot.get_rs485_signal_info()
-            if info[0] == 0:
-                for s in info[1]:
-                    if s["sig_name"] == "_rd":
-                        self.robot.del_tio_rs_signal("_rd")
-                        return s["value"]
-        self.robot.del_tio_rs_signal("_rd")
+        with self._bus_lock:
+            for _ in range(max(1, retries)):
+                with self._rc_call():
+                    self._add_signal("_rd", addr, sig_type)
+                time.sleep(self._READ_WAIT_ADD)
+                with self._rc_call():
+                    self.robot.update_tio_rs_signal({"sig_name": "_rd", "frequency": 5})
+                time.sleep(self._READ_WAIT_UPDATE)
+                with self._rc_call():
+                    info = self.robot.get_rs485_signal_info()
+                if info[0] == 0:
+                    for s in info[1]:
+                        if s["sig_name"] == "_rd":
+                            with self._rc_call():
+                                self.robot.del_tio_rs_signal("_rd")
+                            return s["value"]
+            with self._rc_call():
+                self.robot.del_tio_rs_signal("_rd")
         return None
 
     def _read_regs(self, addr: int, count: int, sig_type: int = SIG_HOLDING) -> list:

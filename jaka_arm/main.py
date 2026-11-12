@@ -4,14 +4,31 @@
 
 Owns `robonix/primitive/arm/*`:
 
-  joint_states  topic_out  ROS 2 /jaka/joint_states (arm joints rad + gripper m)
+  joint_states  topic_out  ROS 2 /jaka/joint_states (arm joints rad + gripper_joint m)
   end_pose      topic_out  ROS 2 /jaka/end_pose      (TCP pose, base frame)
   joint_command topic_in   ROS 2 /jaka/joint_command (position-only write)
   pos_command   topic_in   ROS 2 /jaka/pos_command   (TCP target; IK on provider)
 
+Owns the standard gripper contracts (`robonix/primitive/gripper/*`):
+
+  state         topic_out  ROS 2 /jaka/gripper/state (GripperState; one
+                           message per acquisition round)
+  info          rpc        ROS 2 /jaka/gripper/info  (GetGripperInfo)
+  grip          rpc        ROS 2 /jaka/gripper/grip  (Grip; adaptive close)
+  open          rpc        ROS 2 /jaka/gripper/open  (Open; drive to endpoint)
+
+  `gripper/move` and `gripper/stop` are NOT declared: the TG-9801 has no
+  verified absolute-width command and no halt command, so advertising them
+  would promise semantics the device cannot deliver (see CAPABILITY.md).
+
+`gripper_joint` stays in the arm joint stream as a compatibility view of the
+same measured opening (the skill and the URDF read it); new consumers should
+use `gripper/state` and the gripper services.
+
 Frame, units and writable-field conventions are documented in CAPABILITY.md.
-Motion commands are rejected while `motion_enabled` is false (default) —
-a real safety mode, not a fake disable; see config.spec.
+Motion commands — including gripper grip/open — are rejected while
+`motion_enabled` is false (default): a real safety mode, not a fake disable;
+see config.spec.
 """
 from __future__ import annotations
 
@@ -20,9 +37,13 @@ import threading
 import time
 
 from robonix_api import Primitive, Ok, Err
+from robonix_api.ros import RosBackend
 from geometry_msgs.msg import Pose
 from sensor_msgs.msg import JointState
+from gripper.msg import GripperState
+from gripper.srv import GetGripperInfo, Grip, Open
 
+from . import gripper_contract as gc
 from .driver import (
     JakaDriver,
     JOINT_COUNT,
@@ -31,19 +52,26 @@ from .driver import (
     GRIPPER_STROKE_M,
 )
 
-provider = Primitive(id="jaka_arm", namespace="robonix/primitive/arm")
+# One provider owns both families (arm/* and gripper/*), so the namespace is
+# their common parent rather than `robonix/primitive/arm`.
+provider = Primitive(id="jaka_arm", namespace="robonix/primitive")
 
 ALL_JOINT_NAMES = JOINT_NAMES + [GRIPPER_JOINT_NAME]
+
+# Quiet gap after each gripper acquisition round. The round itself costs
+# ~2.6 s on the RS485 signal-table path, so state refreshes at ~0.3 Hz; the
+# gap keeps the bus idle long enough for a pending grip/release write.
+GRIPPER_ROUND_GAP_S = 0.5
 
 # ---- module state -----------------------------------------------------------
 _driver: JakaDriver | None = None
 _cfg: dict = {}
 _stop_event = threading.Event()
 _state_thread: threading.Thread | None = None
+_gripper_thread: threading.Thread | None = None
 _cmd_queue: "queue.Queue[tuple[str, object] | None]" = queue.Queue()
 _cmd_thread: threading.Thread | None = None
 _last_motion_warn_s = 0.0
-_last_gripper_open_m: float | None = None
 _shutdown_done = False
 
 
@@ -83,12 +111,47 @@ def init(cfg: dict):
         callback=_on_pos_command,
         qos="reliable",
     )
+    provider.create_publisher(
+        contract_id="robonix/primitive/gripper/state",
+        topic=topics.get("gripper_state", "/jaka/gripper/state"),
+        msg_type=GripperState,
+        qos="reliable",
+    )
+    _create_gripper_services(cfg.get("services") or {})
     return Ok()
+
+
+def _create_gripper_services(services: dict) -> None:
+    """Serve gripper/info, gripper/grip and gripper/open over ROS 2.
+
+    Created during init, before activation, so Atlas sees them alongside the
+    topics. Only the rpc contracts the device can actually honour are here.
+    """
+    node = RosBackend.get().node
+    endpoints = (
+        ("robonix/primitive/gripper/info", "info", GetGripperInfo,
+         _on_gripper_info,
+         "Static gripper metadata: opening-width range, accepted grip forms "
+         "and configurable speed settings."),
+        ("robonix/primitive/gripper/grip", "grip", Grip,
+         _on_gripper_grip,
+         "Close adaptively; observe gripper/state for contact and measured "
+         "opening."),
+        ("robonix/primitive/gripper/open", "open", Open,
+         _on_gripper_open,
+         "Open to the configured endpoint; observe gripper/state."),
+    )
+    for contract_id, name, srv_type, handler, description in endpoints:
+        endpoint = services.get(name, f"/jaka/gripper/{name}")
+        node.create_service(srv_type, endpoint, handler)
+        provider.declare_ros2_service(
+            contract_id=contract_id, service=endpoint, description=description,
+        )
 
 
 @provider.on_activate
 def activate():
-    global _driver, _state_thread, _cmd_thread
+    global _driver, _state_thread, _gripper_thread, _cmd_thread
     if _driver is None:
         _driver = JakaDriver(
             ip=_cfg["ip"],
@@ -108,6 +171,10 @@ def activate():
         _stop_event.clear()
         _state_thread = threading.Thread(target=_state_loop, daemon=True)
         _state_thread.start()
+    if _gripper_thread is None or not _gripper_thread.is_alive():
+        _stop_event.clear()
+        _gripper_thread = threading.Thread(target=_gripper_loop, daemon=True)
+        _gripper_thread.start()
     if _cmd_thread is None or not _cmd_thread.is_alive():
         _cmd_thread = threading.Thread(target=_command_worker, daemon=True)
         _cmd_thread.start()
@@ -118,8 +185,11 @@ def activate():
 def deactivate():
     """Stop publishing and abort motion; keep the controller connection."""
     _stop_event.set()
-    if _state_thread is not None:
-        _state_thread.join(timeout=2.0)
+    for thread in (_state_thread, _gripper_thread):
+        if thread is not None:
+            # An in-flight RS485 round can take ~2.6 s before it notices the
+            # stop event; the join has to outlast one round.
+            thread.join(timeout=5.0)
     if _driver is not None:
         _driver.stop_motion()
     return Ok()
@@ -141,9 +211,9 @@ def shutdown():
         # Sentinel before join: the worker blocks on get() until it sees None,
         # so joining first would stall for the full timeout.
         _cmd_queue.put(None)
-    for thread in (_state_thread, _cmd_thread):
+    for thread in (_state_thread, _gripper_thread, _cmd_thread):
         if thread is not None:
-            thread.join(timeout=2.0)
+            thread.join(timeout=5.0)
     if _driver is not None:
         _home_before_shutdown()
         _driver.disconnect()
@@ -192,6 +262,74 @@ def _on_joint_command(msg: JointState) -> None:
 
 def _on_pos_command(msg: Pose) -> None:
     _cmd_queue.put(("pose", msg))
+
+
+# ---- gripper contract services (executor thread) ----------------------------
+def _gripper_speed_default() -> int:
+    return int(_cfg.get("gripper_speed", 1100))
+
+
+def _gripper_command_gate(resp) -> bool:
+    """Common rejection path for gripper motion. True = may dispatch."""
+    if _driver is None:
+        resp.ok, resp.message = False, "provider is not active"
+        return False
+    if not bool(_cfg.get("motion_enabled", False)):
+        resp.ok, resp.message = False, "motion_enabled is false"
+        return False
+    return True
+
+
+def _on_gripper_grip(req, resp):
+    reason = gc.validate_grip(
+        req.relative_effort, req.relative_speed,
+        req.expected_object_width_valid, req.expected_object_width_m,
+    )
+    if reason is not None:
+        resp.ok, resp.message = False, reason
+        return resp
+    if not _gripper_command_gate(resp):
+        return resp
+    speed = gc.relative_speed(req.relative_speed, _gripper_speed_default())
+    ok = _driver.grip_with_speed(speed)
+    resp.ok = bool(ok)
+    resp.message = "" if ok else "the controller rejected the grip command"
+    return resp
+
+
+def _on_gripper_open(req, resp):
+    reason = gc.validate_open(req.relative_speed)
+    if reason is not None:
+        resp.ok, resp.message = False, reason
+        return resp
+    if not _gripper_command_gate(resp):
+        return resp
+    speed = gc.relative_speed(req.relative_speed, _gripper_speed_default())
+    ok = _driver.release_with_speed(speed)
+    resp.ok = bool(ok)
+    resp.message = "" if ok else "the controller rejected the open command"
+    return resp
+
+
+def _on_gripper_info(_req, resp):
+    """Static metadata: what this gripper can actually do, not what it might."""
+    resp.ok = True
+    resp.message = ""
+    resp.grip_effort_configurable = gc.GRIP_EFFORT_CONFIGURABLE
+    resp.move_speed_configurable = gc.MOVE_SPEED_CONFIGURABLE
+    resp.grip_speed_configurable = gc.GRIP_SPEED_CONFIGURABLE
+    resp.open_speed_configurable = gc.OPEN_SPEED_CONFIGURABLE
+    resp.opening_width_range_valid = gc.OPENING_WIDTH_RANGE_VALID
+    resp.min_opening_width_m = gc.MIN_OPENING_M
+    resp.max_opening_width_m = gc.MAX_OPENING_M
+    resp.gripping_force_range_valid = gc.GRIPPING_FORCE_RANGE_VALID
+    resp.min_gripping_force_n = 0.0
+    resp.max_gripping_force_n = 0.0
+    resp.grip_with_expected_object_width_supported = (
+        gc.GRIP_WITH_EXPECTED_WIDTH_SUPPORTED)
+    resp.grip_without_expected_object_width_supported = (
+        gc.GRIP_WITHOUT_EXPECTED_WIDTH_SUPPORTED)
+    return resp
 
 
 # ---- command worker ---------------------------------------------------------
@@ -269,32 +407,67 @@ def _exec_pos_command(msg: Pose) -> None:
         print("[jaka_arm] pos_command: move failed", flush=True)
 
 
-# ---- state publisher ---------------------------------------------------------
+# ---- publishers -------------------------------------------------------------
+def _publish_gripper_state(snapshot) -> None:
+    """Emit one GripperState per acquisition round (not per publish tick)."""
+    open_m, device_state, acquired = snapshot
+    msg = GripperState()
+    if open_m is None:
+        # The contract wants the affected observation invalidated, not the
+        # last value republished as if it were fresh.
+        msg.opening_width_valid = False
+        msg.opening_width_m = 0.0
+    else:
+        msg.opening_width_valid = True
+        msg.opening_width_m = float(open_m)
+    msg.grasp_state = gc.grasp_state(device_state)
+    msg.motion_state = gc.motion_state(device_state)
+    if acquired is not None:
+        # The contract wants the acquisition instant, not the publication one.
+        wall = time.time() - (time.monotonic() - acquired)
+        msg.stamp.sec = int(wall)
+        msg.stamp.nanosec = int((wall - int(wall)) * 1e9)
+    provider.emit("robonix/primitive/gripper/state", msg)
+
+
+def _gripper_loop() -> None:
+    """Acquire and publish gripper state in its own thread.
+
+    A round costs ~2.6 s (two single-entry RS485 reads). Keeping it off the
+    arm loop is what lets joint_states stay at the configured rate while the
+    jaws are being watched.
+    """
+    while not _stop_event.is_set():
+        snapshot = (_driver.get_gripper_snapshot()
+                    if _driver is not None else None)
+        if snapshot is None:
+            _stop_event.wait(0.5)
+            continue
+        _publish_gripper_state(snapshot)
+        _stop_event.wait(GRIPPER_ROUND_GAP_S)
+
+
 def _state_loop() -> None:
     hz = float(_cfg.get("state_publish_hz", 50.0))
     period = max(0.01, 1.0 / hz)
-    global _last_gripper_open_m
     while not _stop_event.wait(period):
         joints = _driver.get_joint_positions_rad()
-        gripper = _driver.get_gripper_open_m()
+        gripper = _driver.get_cached_gripper_open_m()
         pose = _driver.get_tcp_pose()
         if joints is None:
             continue
-        if gripper is not None:
-            _last_gripper_open_m = gripper
         state = JointState()
         state.header.frame_id = str(_cfg.get("base_frame", "world"))
-        if _last_gripper_open_m is None:
-            # No gripper reading yet (first RS485 read still pending, or the
+        if gripper is None:
+            # No gripper reading yet (first RS485 round still pending, or the
             # channel is down): publish the arm joints alone so arm feedback
-            # never depends on gripper health. Once a valid gripper reading
-            # arrives the full name set (arm + gripper_joint) resumes on
-            # every publish.
+            # never depends on gripper health. Once a valid reading arrives
+            # the full name set (arm + gripper_joint) resumes on every publish.
             state.name = JOINT_NAMES
             state.position = list(joints)
         else:
             state.name = ALL_JOINT_NAMES
-            state.position = list(joints) + [_last_gripper_open_m]
+            state.position = list(joints) + [gripper]
         provider.emit("robonix/primitive/arm/joint_states", state)
         if pose is not None:
             from scipy.spatial.transform import Rotation as R

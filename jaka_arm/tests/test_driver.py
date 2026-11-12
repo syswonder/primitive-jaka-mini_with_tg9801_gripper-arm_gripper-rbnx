@@ -15,13 +15,26 @@ from jaka_arm.driver import (
 
 
 class FakeGripper:
-    def __init__(self, pos):
+    def __init__(self, pos, device_state=None):
         self.pos = pos
+        self.device_state = device_state
         self.reads = 0
+        self.commands = []
 
     def read_position(self):
         self.reads += 1
         return self.pos
+
+    def read_state(self):
+        return self.device_state
+
+    def grip(self, speed):
+        self.commands.append(("grip", speed))
+        return 0
+
+    def release(self, speed):
+        self.commands.append(("release", speed))
+        return 0
 
 
 class FakeRC:
@@ -120,6 +133,70 @@ class TestGripperReadCache(unittest.TestCase):
         self.assertIsNone(d.get_gripper_open_m())
         self.assertIsNone(d.get_gripper_open_m())  # no immediate retry
         self.assertEqual(d._gripper.reads, 1)
+
+
+class TestGripperSnapshot(unittest.TestCase):
+    """One acquisition round feeds robonix/primitive/gripper/state."""
+
+    def test_reports_gap_state_and_round_start(self):
+        d = make_driver(FakeRC(), gripper_pos=500)
+        d._gripper.device_state = 2
+        d._gripper_open_pos, d._gripper_close_pos = 0, 1000
+        before = time.monotonic()
+        opening, device_state, acquired = d.get_gripper_snapshot()
+        self.assertAlmostEqual(opening, GRIPPER_STROKE_M / 2, places=6)
+        self.assertEqual(device_state, 2)
+        self.assertGreaterEqual(acquired, before)
+        self.assertLessEqual(acquired, time.monotonic())
+
+    def test_failed_read_reports_invalid_but_keeps_cache(self):
+        d = make_driver(FakeRC(), gripper_pos=0)
+        d._gripper_open_pos, d._gripper_close_pos = 0, 1000
+        d.get_gripper_snapshot()
+        d._gripper.pos = None
+        opening, device_state, _ = d.get_gripper_snapshot()
+        self.assertIsNone(opening)          # contract: width invalidated
+        self.assertIsNone(device_state)
+        self.assertAlmostEqual(d.get_cached_gripper_open_m(), GRIPPER_STROKE_M,
+                               places=6)   # joint stream keeps the last reading
+
+    def test_cached_reader_never_touches_the_bus(self):
+        d = make_driver(FakeRC(), gripper_pos=0)
+        d._gripper_open_pos, d._gripper_close_pos = 0, 1000
+        d.get_gripper_snapshot()
+        reads = d._gripper.reads
+        self.assertAlmostEqual(d.get_cached_gripper_open_m(), GRIPPER_STROKE_M,
+                               places=6)
+        self.assertEqual(d._gripper.reads, reads)
+
+    def test_not_connected_returns_none(self):
+        d = make_driver(FakeRC(), gripper_pos=0)
+        d._connected = False
+        self.assertIsNone(d.get_gripper_snapshot())
+
+
+class TestGripperCommands(unittest.TestCase):
+    def test_explicit_speeds_reach_the_device(self):
+        d = make_driver(FakeRC(), gripper_pos=0)
+        self.assertTrue(d.grip_with_speed(1200))
+        self.assertTrue(d.release_with_speed(900))
+        self.assertEqual(d._gripper.commands,
+                         [("grip", 1200), ("release", 900)])
+
+    def test_binary_setter_uses_configured_speed(self):
+        d = make_driver(FakeRC(), gripper_pos=0)
+        d._gripper_speed = 1100
+        self.assertTrue(d.set_gripper_open_m(GRIPPER_STROKE_M))
+        self.assertTrue(d.set_gripper_open_m(0.0))
+        self.assertEqual(d._gripper.commands,
+                         [("release", 1100), ("grip", 1100)])
+
+    def test_not_connected_rejects(self):
+        d = make_driver(FakeRC(), gripper_pos=0)
+        d._connected = False
+        self.assertFalse(d.grip_with_speed(1100))
+        self.assertFalse(d.release_with_speed(1100))
+        self.assertEqual(d._gripper.commands, [])
 
 
 class TestJointLimits(unittest.TestCase):

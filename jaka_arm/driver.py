@@ -5,11 +5,14 @@
 """JakaDriver — minimal jkrc SDK adapter for the Robonix jaka_arm primitive.
 
 Surface: connect/disconnect/stop_motion, joint & TCP feedback, joint move,
-Cartesian move with controller-side IK fallback, binary adaptive gripper.
+Cartesian move with controller-side IK fallback, TG-9801 adaptive gripper
+(grip/release with an explicit speed, one acquisition round for the standard
+gripper/state contract).
 
 Units: joints in rad (SDK native), TCP pose in m + rpy rad, gripper opening
-in m (TG-9801 stroke, normalized). All RC calls are serialized by one RLock
-so the state-publish thread can interleave with motion commands.
+in m (two-finger gap, 0-0.098). Arm RC calls are serialized by one RLock; the
+gripper's RS485 reads take that lock per SDK call only, so their ~1.3 s
+signal-table waits do not stall arm feedback.
 """
 from __future__ import annotations
 
@@ -30,9 +33,10 @@ JOINT_NAMES = [f"joint_{i}" for i in range(1, 7)]
 GRIPPER_JOINT_NAME = "gripper_joint"
 # TG-9801 total stroke (datasheet: 可调行程 0~98 mm)
 GRIPPER_STROKE_M = 0.098
-# A gripper position read costs ~1.3 s (single-entry RS485 signal-table path,
-# see gripper.JakaGripper._read_reg), so the 50 Hz state loop serves a cached
-# value and re-reads at most this often.
+# A gripper acquisition round costs ~2.6 s (two single-entry RS485 reads,
+# see gripper.JakaGripper._read_reg), so the arm state loop serves the cached
+# value and a dedicated thread refreshes it. This interval is the floor for
+# on-demand reads through get_gripper_open_m().
 GRIPPER_READ_INTERVAL_S = 2.0
 
 # JAKA Mini soft limits (user manual table 5-1, degrees). Verified against
@@ -73,9 +77,32 @@ class JakaDriver:
         self._gripper = None
         self._gripper_close_pos = 1000  # fallback: 1000 = closed (reverse travel)
         self._gripper_open_pos = 0      # fallback: 0 = open
-        self._gripper_open_m = None     # cached reading (see get_gripper_open_m)
-        self._gripper_open_m_mono = None
+        # Cached acquisition result, guarded by its own lock so the 50 Hz loop
+        # can read it without waiting on an in-flight RS485 read.
+        self._gripper_state_lock = threading.Lock()
+        self._gripper_open_m = None     # last acquired two-finger gap, m
+        self._gripper_state = None      # last raw holding-state register (0..3)
+        self._gripper_open_m_mono = None  # start of that acquisition round
+        # A move in flight (joint or Cartesian, plus its reach polling). RS485
+        # register polling is suppressed meanwhile: the signal-table churn
+        # competes with the controller's motion handling, and 2026-11-12 a
+        # concurrent poll ended in a jkrc SIGSEGV mid-move.
+        self._motion_lock = threading.Lock()
+        self._motion_depth = 0
         self._connected = False
+
+    def _begin_motion(self) -> None:
+        with self._motion_lock:
+            self._motion_depth += 1
+
+    def _end_motion(self) -> None:
+        with self._motion_lock:
+            self._motion_depth = max(0, self._motion_depth - 1)
+
+    @property
+    def motion_active(self) -> bool:
+        with self._motion_lock:
+            return self._motion_depth > 0
 
     # ---------- lifecycle ----------
 
@@ -88,7 +115,7 @@ class JakaDriver:
             ret = self._rc.login()
             if ret[0] != 0:
                 raise ConnectionError(f"JAKA login failed ({self._ip}): {ret}")
-            self._gripper = JakaGripper(robot=self._rc)
+            self._gripper = JakaGripper(robot=self._rc, rc_lock=self._lock)
             self._gripper.power_on()  # re-arms RS485 channel after power cycle
             self._rc.enable_robot()
             self._gripper.set_target_force(self._gripper_force)
@@ -137,8 +164,10 @@ class JakaDriver:
             self._connected = False
             self._gripper = None
             self._rc = None
-            self._gripper_open_m = None
-            self._gripper_open_m_mono = None
+            with self._gripper_state_lock:
+                self._gripper_open_m = None
+                self._gripper_state = None
+                self._gripper_open_m_mono = None
 
     def stop_motion(self) -> None:
         with self._lock:
@@ -160,30 +189,77 @@ class JakaDriver:
                 return None
             return [float(a) for a in ret[1]]
 
+    def get_cached_gripper_open_m(self) -> float | None:
+        """Last acquired opening in m; never touches the bus.
+
+        The 50 Hz arm loop uses this so arm feedback never waits on a ~1.3 s
+        RS485 register read; the acquisition thread (main._gripper_loop)
+        refreshes the cache.
+        """
+        with self._gripper_state_lock:
+            return self._gripper_open_m
+
     def get_gripper_open_m(self) -> float | None:
         """Last known opening in m, re-read at most every GRIPPER_READ_INTERVAL_S.
 
-        The 50 Hz state loop must not read every cycle: a read stalls ~1.3 s
-        and keeps the half-duplex bus busy, risking dropped grip/release
-        frames. Between reads the previous value is served; a failed attempt
-        (None) also waits a full interval before retrying.
+        Between reads the previous value is served; a failed attempt (None)
+        also waits a full interval before retrying.
         """
-        with self._lock:
-            if not self._connected:
+        with self._gripper_state_lock:
+            if not self._connected or self._gripper is None:
                 return None
-            now = time.monotonic()
-            if (self._gripper_open_m_mono is None
-                    or now - self._gripper_open_m_mono >= GRIPPER_READ_INTERVAL_S):
-                pos = self._gripper.read_position()
-                self._gripper_open_m_mono = time.monotonic()
-                if pos is not None:
-                    lo, hi = self._gripper_close_pos, self._gripper_open_pos
-                    if hi == lo:
-                        value = 0.0
-                    else:
-                        value = (pos - lo) / (hi - lo)  # 1 = fully open (both travel dirs)
-                    self._gripper_open_m = float(np.clip(value, 0, 1)) * GRIPPER_STROKE_M
-            return self._gripper_open_m
+            stale = (self._gripper_open_m_mono is None
+                     or time.monotonic() - self._gripper_open_m_mono
+                     >= GRIPPER_READ_INTERVAL_S)
+        if stale:
+            self._acquire_gripper()
+        return self.get_cached_gripper_open_m()
+
+    def get_gripper_snapshot(self):
+        """One acquisition round for ``robonix/primitive/gripper/state``.
+
+        Returns ``(opening_m, device_state, acquired_monotonic)``, or None when
+        the provider is not connected. ``opening_m`` is None when that register
+        could not be read - the contract then wants ``opening_width_valid``
+        false rather than the last value. ``device_state`` is the raw holding
+        state (0 idle / 1 moving / 2 holding / 3 slipping; None on a failed
+        read). The monotonic stamp is the start of this round, not the publish
+        instant.
+        """
+        return self._acquire_gripper()
+
+    def _acquire_gripper(self):
+        """Read opening + device state, cache both, return the round result.
+
+        Skipped while a move is in flight: the caller keeps its previous
+        cached value, and the next round after the move resumes the stream.
+        """
+        gripper = self._gripper
+        if not self._connected or gripper is None:
+            return None
+        if self.motion_active:
+            return None
+        started = time.monotonic()
+        pos = gripper.read_position()
+        device_state = gripper.read_state()
+        opening = self._opening_from_position(pos)
+        with self._gripper_state_lock:
+            if opening is not None:
+                self._gripper_open_m = opening
+            self._gripper_state = device_state
+            self._gripper_open_m_mono = started
+        return opening, device_state, started
+
+    def _opening_from_position(self, pos: int | None) -> float | None:
+        if pos is None:
+            return None
+        lo, hi = self._gripper_close_pos, self._gripper_open_pos
+        if hi == lo:
+            value = 0.0
+        else:
+            value = (pos - lo) / (hi - lo)  # 1 = fully open (both travel dirs)
+        # + 0.0 turns a negative zero into +0.0: valid widths are nonnegative.
+        return float(np.clip(value, 0.0, 1.0) + 0.0) * GRIPPER_STROKE_M
 
     def get_tcp_pose(self) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
         """TCP pose as ((x, y, z) m, (rx, ry, rz) rad, R = Rz·Ry·Rx order)."""
@@ -220,18 +296,30 @@ class JakaDriver:
             print(f"[jaka_arm] joint target out of limits: "
                   f"{[round(np.degrees(a), 1) for a in positions_rad]}", flush=True)
             return False
-        with self._lock:
-            if not self._connected:
-                return False
-            ret = self._rc.joint_move(positions_rad, ABS, False, self._joint_speed_rad_s)
-            if ret[0] != 0:
-                print(f"[jaka_arm] joint_move error {ret[0]}", flush=True)
-                return False
-        return self._wait_reached(positions_rad)
+        self._begin_motion()
+        try:
+            with self._lock:
+                if not self._connected:
+                    return False
+                ret = self._rc.joint_move(positions_rad, ABS, False,
+                                          self._joint_speed_rad_s)
+                if ret[0] != 0:
+                    print(f"[jaka_arm] joint_move error {ret[0]}", flush=True)
+                    return False
+            return self._wait_reached(positions_rad)
+        finally:
+            self._end_motion()
 
     def move_pose(self, pos_m: list[float], rpy_rad: list[float]) -> bool:
         """Cartesian move; on linear failure or singular start, fall back to
         controller-side IK plus a joint move (AIIT hybrid strategy)."""
+        self._begin_motion()
+        try:
+            return self._move_pose_inner(pos_m, rpy_rad)
+        finally:
+            self._end_motion()
+
+    def _move_pose_inner(self, pos_m: list[float], rpy_rad: list[float]) -> bool:
         pose = [pos_m[0] * 1000, pos_m[1] * 1000, pos_m[2] * 1000, *rpy_rad]
 
         joints = self.get_joint_positions_rad()
@@ -258,14 +346,27 @@ class JakaDriver:
             return False
         return self.move_joints_rad([float(np.radians(a)) for a in solution])
 
+    # ---------- gripper commands ----------
+
+    def grip_with_speed(self, speed: int) -> bool:
+        """Close adaptively at an explicit device speed (200-1500)."""
+        gripper = self._gripper
+        if not self._connected or gripper is None:
+            return False
+        return gripper.grip(int(speed)) == 0
+
+    def release_with_speed(self, speed: int) -> bool:
+        """Open adaptively at an explicit device speed (200-1500)."""
+        gripper = self._gripper
+        if not self._connected or gripper is None:
+            return False
+        return gripper.release(int(speed)) == 0
+
     def set_gripper_open_m(self, open_m: float) -> bool:
         """TG-9801 adaptive mode is binary: >= half stroke = release, else grip."""
-        with self._lock:
-            if not self._connected:
-                return False
-            if open_m >= 0.5 * GRIPPER_STROKE_M:
-                return self._gripper.release(self._gripper_speed) == 0
-            return self._gripper.grip(self._gripper_speed) == 0
+        if open_m >= 0.5 * GRIPPER_STROKE_M:
+            return self.release_with_speed(self._gripper_speed)
+        return self.grip_with_speed(self._gripper_speed)
 
     # ---------- internals ----------
 
